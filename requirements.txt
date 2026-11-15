@@ -3,4 +3,3 @@ aiosqlite==0.20.0
 python-dotenv==1.0.1
 pytz
 pydantic==2.10.6
-pydantic-core==2.27.2
