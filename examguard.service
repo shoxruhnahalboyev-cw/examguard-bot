@@ -1,0 +1,21 @@
+[Unit]
+Description=ExamGuard AI Telegram bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=examguard
+WorkingDirectory=/opt/examguard
+EnvironmentFile=/opt/examguard/.env
+# /var/lib/examguard papkasini systemd o'zi yaratadi va faqat shu foydalanuvchiga beradi
+StateDirectory=examguard
+Environment=DB_PATH=/var/lib/examguard/examguard.db
+ExecStart=/opt/examguard/venv/bin/python examguard_bot.py
+Restart=always
+RestartSec=5
+# To'xtatilganda bot oxirgi zaxira nusxani yuborib ulguradi
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

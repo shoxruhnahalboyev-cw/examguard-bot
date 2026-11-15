@@ -1,8 +1,10 @@
 import asyncio
+import hashlib
 import html
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import datetime, time as dtime, timedelta
@@ -10,6 +12,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import aiosqlite
 import pytz
+from aiohttp import web
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -18,6 +21,8 @@ from aiogram.types import (
     BotCommand,
     CallbackQuery,
     ChatMemberUpdated,
+    FSInputFile,
+    InputMediaDocument,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -25,29 +30,39 @@ from aiogram.types import (
 
 try:
     from dotenv import load_dotenv
+
     load_dotenv()
 except ImportError:
     pass
 
 # ============================================================================
-# SOZLAMALAR (.env faylidan o'qiladi)
+# SOZLAMALAR
 # ============================================================================
+# Token kodda emas: .env fayliga  BOT_TOKEN=...  deb yozing
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
-    sys.exit("❌ XATOLIK: BOT_TOKEN topilmadi! .env faylga BOT_TOKEN=... deb yozing.")
+    sys.exit("❌ BOT_TOKEN topilmadi. .env faylga BOT_TOKEN=... deb yozing.")
 
 CREATOR_ID = int(os.getenv("CREATOR_ID", "7439126820"))
 
-DB_NAME = "examguard.db"
+DB_NAME = os.getenv("DB_PATH", "examguard.db")   # VPS da: /var/lib/examguard/examguard.db
 TZ = pytz.timezone("Asia/Tashkent")
 UTC = pytz.utc
-CHECK_INTERVAL = 2            # Skeyuler tekshiruv oralig'i (soniya)
-BAN_DAYS = 3                  # Muddatida topshirmaganlar uchun chetlashtirish kunlari
-WARN_MINUTES = 30             # Tugashiga necha daqiqa qolganda ogohlantirish
-DURATION_TOLERANCE = 0        # 0 = aynan bir xil soniya; 1 = ±1 soniya farq
+CHECK_INTERVAL = 2            # skeyuler tekshiruv oralig'i (soniya)
+BAN_DAYS = 3
+WARN_MINUTES = 30             # tugashiga necha daqiqa qolganda ogohlantirish
+DURATION_TOLERANCE = 0        # 0 = aynan bir xil soniya; 1 = ±1 soniya ham bir xil hisoblanadi
 ALLOW_FORWARDED_VOICE = False
-ADMIN_CACHE_TTL = 60          # Adminlik tekshiruvi keshi (soniya)
+ADMIN_CACHE_TTL = 60          # adminlik tekshiruvi keshi (soniya)
 GROUP_TYPES = ("group", "supergroup")
+
+# --- Zaxira nusxa (Telegram orqali) va ishga tushish sozlamalari ---
+BACKUP_ENABLED = os.getenv("BACKUP_ENABLED", "1") != "0"
+BACKUP_CHAT_ID = int(os.getenv("BACKUP_CHAT_ID", str(CREATOR_ID)))  # odatda yaratuvchining shaxsiy chati
+BACKUP_INTERVAL = 300         # o'zgarish bo'lmasa ham har 5 daqiqada tekshirib ko'radi
+BACKUP_MIN_GAP = 20          # ketma-ket yuklashlar orasidagi minimal pauza (soniya)
+STARTUP_GRACE = 60           # qayta yoqilgandan keyin skeyuler kutish vaqti: navbatdagi javoblar ulgurib qolsin
+BACKUP_FILENAME = "examguard_backup.db"
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher()
@@ -59,7 +74,7 @@ TASK_CAPTION_RE = re.compile(r"^/task(?:@\w+)?(?:\s|$)", re.I)
 esc = html.escape
 
 # ============================================================================
-# BAZA VA KESHLAR (Tezkor ishlash va poyga holatidan himoya)
+# BAZA: bitta doimiy ulanish + keshlar
 # ============================================================================
 _db_conn: Optional[aiosqlite.Connection] = None
 _db_lock = asyncio.Lock()
@@ -67,6 +82,7 @@ _approved_groups_cache: set = set()
 _seen: set = set()
 _admin_cache: Dict[Tuple[int, int], Tuple[bool, float]] = {}
 
+# Yangi ustun kerak bo'lsa, shu yerga yozing: eski baza o'zi yangilanadi
 SCHEMA_COLUMNS: Dict[str, List[Tuple[str, str]]] = {
     "groups": [
         ("teacher_id", "INTEGER"),
@@ -110,6 +126,7 @@ SCHEMA_COLUMNS: Dict[str, List[Tuple[str, str]]] = {
 async def get_db() -> aiosqlite.Connection:
     global _db_conn
     if _db_conn is None:
+        os.makedirs(os.path.dirname(os.path.abspath(DB_NAME)), exist_ok=True)
         _db_conn = await aiosqlite.connect(DB_NAME)
         await _db_conn.execute("PRAGMA journal_mode=WAL;")
         await _db_conn.execute("PRAGMA synchronous=NORMAL;")
@@ -133,6 +150,7 @@ async def run(sql: str, params: tuple = ()) -> int:
     db = await get_db()
     cur = await db.execute(sql, params)
     await db.commit()
+    request_backup()
     return cur.rowcount
 
 
@@ -208,15 +226,18 @@ async def init_db():
         )
     """)
 
+    # --- Xavfsiz migratsiya: yetishmayotgan ustunlarni qo'shadi, ma'lumotni o'chirmaydi ---
     for table, columns in SCHEMA_COLUMNS.items():
         for column, ddl in columns:
             added = await ensure_column(table, column, ddl)
             if added and table == "groups" and column == "is_approved":
+                # Eski guruhlar ruxsatsiz qolib ketmasligi uchun bir marta tasdiqlanadi
                 await db.execute("UPDATE groups SET is_approved = 1")
 
     await db.execute("UPDATE tasks SET created_at = '2000-01-01 00:00:00' WHERE created_at IS NULL")
     await db.execute("UPDATE answers SET submitted_at = datetime('now') WHERE submitted_at IS NULL")
 
+    # NULL ismlarni to'ldirish: avval eski username ustunidan, qolganini "O'quvchi" bilan
     for table in ("group_members", "answers"):
         if "username" in await table_columns(table):
             await db.execute(
@@ -225,6 +246,7 @@ async def init_db():
             )
         await db.execute(f"UPDATE {table} SET full_name = 'O''quvchi' WHERE full_name IS NULL OR full_name = ''")
 
+    # Tezlik uchun indekslar
     await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(is_active, deadline)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_tasks_chat ON tasks(chat_id, is_active)")
     await db.execute("CREATE INDEX IF NOT EXISTS idx_answers_task_user ON answers(task_id, user_id)")
@@ -234,7 +256,7 @@ async def init_db():
     for (chat_id,) in await q_all("SELECT chat_id FROM groups WHERE is_approved = 1"):
         _approved_groups_cache.add(chat_id)
 
-    print("📁 Ma'lumotlar bazasi xavfsiz yangilandi va kesh yuklandi!")
+    print("📁 Ma'lumotlar bazasi eskisini to'liq saqlagan holda xavfsiz yangilandi!")
 
 
 async def set_bot_commands():
@@ -268,6 +290,7 @@ def utc_str() -> str:
 
 
 def parse_deadline(deadline_str: str) -> datetime:
+    # pytz bilan replace(tzinfo=...) ISHLATILMAYDI (noto'g'ri offset beradi), localize ishlatiladi
     return TZ.localize(datetime.strptime(deadline_str, "%Y-%m-%d %H:%M"))
 
 
@@ -279,6 +302,7 @@ def parse_utc(value: str) -> Optional[datetime]:
 
 
 def raw_name(user) -> str:
+    """Bazaga yoziladigan toza ism-familiya (HTML escape QILINMAGAN)."""
     if not user:
         return "O'quvchi"
     name = (user.first_name or "").strip()
@@ -290,6 +314,7 @@ def raw_name(user) -> str:
 
 
 def label(user) -> str:
+    """Xabarda ko'rsatish uchun (html.escape qilingan)."""
     return esc(raw_name(user))
 
 
@@ -301,7 +326,7 @@ async def is_user_admin(message: Message) -> bool:
     if message.chat.type == "private":
         return False
     if message.sender_chat and message.sender_chat.id == message.chat.id:
-        return True
+        return True  # anonim admin
     if not message.from_user:
         return False
 
@@ -331,6 +356,7 @@ async def is_group_approved(chat_id: int) -> bool:
 
 
 async def get_active_task(chat_id: int):
+    """(id, task_text, deadline, created_at, photo_id)"""
     return await q_one(
         "SELECT id, task_text, deadline, created_at, photo_id FROM tasks "
         "WHERE chat_id = ? AND is_active = 1 ORDER BY id DESC LIMIT 1",
@@ -342,20 +368,19 @@ async def group_guard(message: Message, admin_only: bool = False, allow_private:
     if message.chat.type == "private":
         if allow_private:
             return True
-        await message.answer("⚠️ Kechirasiz, bu buyruq faqat o'quv guruhida ishlaydi.")
+        await message.answer("⚠️ Bu buyruq faqat guruhda ishlaydi.")
         return False
 
     if not await is_group_approved(message.chat.id):
         await message.reply(
-            "⚠️ Hurmatli a'zolar, bu guruh bot yaratuvchisi tomonidan hali tasdiqlanmagan. "
-            "Tasdiq olinmaguncha tizim buyruqlari yopiq turadi."
+            "⚠️ Bu guruh bot yaratuvchisi tomonidan hali tasdiqlanmagan. Tasdiq kelguncha buyruqlar ishlamaydi."
         )
         return False
 
     if admin_only and not await is_user_admin(message):
         await message.reply(
-            "⛔️ Kechirasiz, bu buyruq faqat guruh <b>Ustoziga</b> (administratorga) tegishli. "
-            "Ustoz stuliga o'tirish uchun avval imtihondan a'lo bahoga o'tish kerak 😉"
+            "⛔️ Bu buyruq faqat guruh <b>Ustoziga</b> (administratorga) tegishli. "
+            "Ustoz stuliga o'tirish uchun avval imtihondan o'tish kerak 😉"
         )
         return False
     return True
@@ -395,7 +420,7 @@ def task_question_numbers(task_text: str) -> set:
 # ============================================================================
 async def save_answer(chat_id: int, task_id: int, user, question_num: str, voice) -> Tuple[bool, str]:
     db = await get_db()
-    async with _db_lock:
+    async with _db_lock:  # bir vaqtda kelgan ikki ovoz "tekshir-keyin-yoz" poygasiga tushmasin
         if await q_one("SELECT 1 FROM tasks WHERE id = ? AND is_active = 1", (task_id,)) is None:
             return False, "no_task"
 
@@ -410,6 +435,7 @@ async def save_answer(chat_id: int, task_id: int, user, question_num: str, voice
             if q_num == question_num:
                 same_question = True
                 continue
+            # BOSHQA savollarga berilgan javoblar bilan solishtiriladi (almashtirishda ham!)
             if content == voice.file_id or (unique_id and unique_id == voice.file_unique_id):
                 return False, "duplicate_file"
             if dur and abs(dur - voice.duration) <= DURATION_TOLERANCE:
@@ -429,6 +455,7 @@ async def save_answer(chat_id: int, task_id: int, user, question_num: str, voice
                  chat_id, task_id, user.id, question_num),
             )
             await db.commit()
+            request_backup()
             return True, "updated"
 
         await db.execute(
@@ -438,6 +465,7 @@ async def save_answer(chat_id: int, task_id: int, user, question_num: str, voice
              voice.file_id, voice.file_unique_id, voice.duration, utc_str()),
         )
         await db.commit()
+    request_backup()
     return True, "success"
 
 
@@ -448,24 +476,36 @@ async def process_answer(message: Message, args_text: str):
 
     if not args or not re.fullmatch(r"[0-9]{1,2}", args[0]):
         await message.reply(
-            f"⚠️ Hurmatli <b>{name}</b>, qaysi savolga javob berayotganingizni ko'rsatmadingiz.\n"
-            "<b>To'g'ri namuna:</b> O'zingizning ovozli xabaringizga reply qilib <code>/answer 1</code> yuboring."
+            f"⚠️ Hurmatli <b>{name}</b>, qaysi savolga javob berayotganingiz ko'rsatilmagan.\n"
+            "<b>To'g'ri format:</b> o'zingizning ovozli xabaringizga reply qilib <code>/answer 1</code> yuboring."
         )
         return
 
     question_num = str(int(args[0]))
     task = await get_active_task(message.chat.id)
     if not task:
-        await message.reply(f"⚠️ Hurmatli <b>{name}</b>, hozirda faol vazifa mavjud emas. Ustoz e'lon qilishini kuting.")
+        await message.reply(f"⚠️ <b>{name}</b>, hozirda faol vazifa yo'q. Shoshilmang, Ustoz e'lon qiladi.")
         return
-    task_id, task_text, _, created_at, _ = task
+    task_id, task_text, deadline_str, created_at, _ = task
 
     numbers = task_question_numbers(task_text)
     if numbers and question_num not in numbers:
         await message.reply(
-            f"⚠️ Hurmatli <b>{name}</b>, ushbu vazifada <b>{question_num}-savol</b> mavjud emas. "
-            f"Mavjud savollar raqami: <b>{', '.join(sorted(numbers, key=int))}</b>. Iltimos, diqqatli bo'ling."
+            f"⚠️ <b>{name}</b>, vazifada <b>{question_num}-savol</b> yo'q. "
+            f"Mavjud savollar: <b>{', '.join(sorted(numbers, key=int))}</b>."
         )
+        return
+
+    # Bot o'chiq turganda yig'ilib qolgan xabarlar: muddatdan KEYIN yuborilgani qabul qilinmaydi
+    try:
+        deadline_dt = parse_deadline(deadline_str)
+    except ValueError:
+        deadline_dt = None
+    msg_date = message.date
+    if msg_date and msg_date.tzinfo is None:
+        msg_date = UTC.localize(msg_date)
+    if deadline_dt and msg_date and msg_date > deadline_dt + timedelta(seconds=5):
+        await message.reply(f"⛔️ <b>{name}</b>, javob muddatdan keyin yuborilgan, qabul qilinmaydi.")
         return
 
     voice_msg = None
@@ -476,20 +516,20 @@ async def process_answer(message: Message, args_text: str):
 
     if not voice_msg:
         await message.reply(
-            f"⚠️ Hurmatli <b>{name}</b>, imtihon talabiga ko'ra matn emas, jonli ovozingiz baholanadi! 🎙\n"
-            f"Avval ovozli xabar yuboring, so'ngra unga reply qilib <code>/answer {question_num}</code> deb yozing."
+            f"⚠️ <b>{name}</b>, imtihonda matn emas, ovoz baholanadi! 🎙\n"
+            f"Ovozli xabar yuboring va unga reply qilib <code>/answer {question_num}</code> deb yozing."
         )
         return
 
     voice = voice_msg.voice
 
     if voice_msg.from_user and voice_msg.from_user.id != user.id:
-        await message.reply(f"⛔️ <b>{name}</b>, faqat o'zingiz yozgan ovozli xabarga reply qilishingiz mumkin. Boshqalarning javobidan foydalanish taqiqlanadi!")
+        await message.reply(f"⛔️ <b>{name}</b>, faqat o'zingizning ovozli xabaringizga reply qilishingiz mumkin.")
         return
 
     if not ALLOW_FORWARDED_VOICE and is_forwarded(voice_msg):
         await message.reply(
-            f"⛔️ <b>{name}</b>, forward (uzatilgan) ovozli xabarlar qabul qilinmaydi! Iltimos, o'zingiz yangidan ovoz yozing."
+            f"⛔️ <b>{name}</b>, forward qilingan ovozli xabar qabul qilinmaydi. Iltimos, o'zingiz yangidan yozing."
         )
         return
 
@@ -499,44 +539,46 @@ async def process_answer(message: Message, args_text: str):
         voice_date = UTC.localize(voice_date)
     if created and voice_date and voice_date < created - timedelta(seconds=5):
         await message.reply(
-            f"⛔️ <b>{name}</b>, bu ovoz vazifa berilishidan oldin yozilgan ekan. Vazifadan keyin yangi javob yozing!"
+            f"⛔️ <b>{name}</b>, bu ovoz vazifa e'lon qilinishidan oldin yozilgan. Vazifadan keyin yangi ovoz yozing."
         )
         return
 
     success, err = await save_answer(message.chat.id, task_id, user, question_num, voice)
     if success and err == "updated":
         await message.reply(
-            f"🔄 Rahmat, <b>{name}</b>! <b>{question_num}-savol</b> uchun yuborgan yangi ovozingiz ({voice.duration} sek) avvalgisining o'rniga qabul qilindi."
+            f"🔄 <b>{name}</b>, <b>{question_num}-savol</b> javobingiz yangisiga almashtirildi ({voice.duration} sek)."
         )
     elif success:
         await message.reply(
-            f"✅ Barakalla, <b>{name}</b>! <b>{question_num}-savol</b> javobingiz muvaffaqiyatli qabul qilindi ({voice.duration} sek). Shu ruhda davom eting!"
+            f"✅ <b>{name}</b>, <b>{question_num}-savol</b> javobingiz qabul qilindi ({voice.duration} sek). Davom eting!"
         )
     elif err in ("duplicate_file", "duplicate_duration"):
         await message.reply(
-            f"🛑 <b>{name}</b>, bu ovozli xabarni (yoki aynan shu soniyadagi xabarni) boshqa savolga ishlatgansiz! "
-            f"Anticheat qoidasiga ko'ra har bir savolga alohida, har xil soniyadagi voice yuborishingiz shart."
+            f"⚠️ <b>{name}</b>, bu ovozli xabarni (yoki bu soniyadagi xabarni) allaqachon boshqa savolga ishlatgansiz, "
+            f"har bir savolga alohida har xil voice yuboring!"
         )
     elif err == "other_user_file":
-        await message.reply(f"⛔️ <b>{name}</b>, bu ovoz boshqa o'quvchiga tegishli! Faqat o'z bilimingizga tayaning.")
+        await message.reply(f"⛔️ <b>{name}</b>, bu ovoz boshqa o'quvchi tomonidan yuborilgan. Faqat o'zingiznikini yuboring.")
     elif err == "no_task":
-        await message.reply("⚠️ Afsuski, vazifa muddati yakunlangan yoki bekor qilingan. Javob qabul qilinmadi.")
+        await message.reply("⚠️ Vazifa muddati tugagan yoki bekor qilingan. Javob qabul qilinmadi.")
     else:
-        await message.reply("⚠️ Texnik xatolik yuz berdi, iltimos qaytadan urinib ko'ring.")
+        await message.reply("⚠️ Xatolik yuz berdi, qaytadan urinib ko'ring.")
 
 
 # ============================================================================
-# BOT GURUHGA QO'SHILISHI / CHIQISHI (Yaratuvchi ruxsati)
+# BOT GURUHGA QO'SHILISHI / CHIQISHI (yaratuvchi ruxsati)
 # ============================================================================
 def intro_text() -> str:
     return (
-        "🛡 <b>ExamGuard AI guruhga muvaffaqiyatli ulandi va ishga tushdi!</b>\n\n"
-        "🤖 <b>Asosiy vazifamiz:</b> CEFR Speaking va Writing imtihonlariga tayyorgarlik jarayonida temir intizom va adolatli nazoratni ta'minlash.\n\n"
-        "👨‍🏫 <b>Ustozlar uchun:</b> <code>/task 21:00 1. What is your hobby?</code> (rasm bilan ham mumkin)\n"
-        "👩‍🎓 <b>O'quvchilar uchun:</b> O'zingizning ovozli xabaringizga reply qilib <code>/answer &lt;raqam&gt;</code> yuboring.\n"
-        "⚠️ <b>Anticheat:</b> Har bir savolga alohida va har xil soniyadagi ovoz yuborilishi shart.\n"
-        f"⚠️ <i>Qoida barchaga barobar: belgilangan muddatda topshirmaganlar {BAN_DAYS} kunga guruhdan chetlashtiriladi.</i>\n\n"
-        "To'liq qo'llanma: /help"
+        "🛡 <b>ExamGuard AI guruhga ulandi va faollashdi!</b>\n\n"
+        "🤖 <b>Vazifamiz:</b> CEFR Speaking va Writing tayyorgarligi hamda qat'iy intizomni nazorat qilish.\n\n"
+        "👨‍🏫 <b>Ustoz uchun:</b> <code>/task 21:00 1. What is your hobby?</code>\n"
+        "(yoki rasm yuborib, izohiga shuni yozing)\n"
+        "👩‍🎓 <b>O'quvchilar uchun:</b> o'zingizning ovozli xabaringizga reply qilib "
+        "<code>/answer &lt;raqam&gt;</code> yuboring.\n"
+        "⚠️ <b>Anticheat:</b> har bir savolga alohida va har xil soniyadagi ovoz yuboring.\n"
+        f"⚠️ <i>Qoida qat'iy: muddatida topshirmaganlar {BAN_DAYS} kunga chetlashtiriladi.</i>\n\n"
+        "Batafsil: /help"
     )
 
 
@@ -549,11 +591,13 @@ async def bot_status_changed(event: ChatMemberUpdated):
     old_status = event.old_chat_member.status
     new_status = event.new_chat_member.status
 
+    # Bot chiqarildi: kesh va ruxsat bekor qilinadi (keyingi qo'shilishda yana so'raladi)
     if new_status in ("left", "kicked"):
         _approved_groups_cache.discard(chat_id)
         await run("UPDATE groups SET is_approved = 0 WHERE chat_id = ?", (chat_id,))
         return
 
+    # Faqat YANGI qo'shilish. Botga admin berilganda (member -> administrator) tasdiq o'chmaydi
     if not (old_status in ("left", "kicked") and new_status in ("member", "administrator")):
         return
 
@@ -563,6 +607,7 @@ async def bot_status_changed(event: ChatMemberUpdated):
     adder_name = raw_name(adder) if adder else "Noma'lum"
     adder_username = f"@{adder.username}" if adder and adder.username else "yo'q"
 
+    # Eski ruxsat keshda qolib ketmasin
     _approved_groups_cache.discard(chat_id)
 
     if adder_id == CREATOR_ID:
@@ -590,7 +635,7 @@ async def bot_status_changed(event: ChatMemberUpdated):
         await bot.send_message(
             chat_id,
             "🛡 <b>ExamGuard AI</b> guruhga qo'shildi.\n\n"
-            "⚠️ <i>Xavfsizlik qoidasiga ko'ra, botni ishlatish uchun yaratuvchining rasmiy tasdig'i kutilmoqda.</i>",
+            "⚠️ <i>Xavfsizlik talabiga ko'ra, botni ishlatish uchun yaratuvchining tasdig'i kutilmoqda.</i>",
         )
     except Exception as e:
         logging.error(f"Guruhga xabar yuborishda xato: {e}")
@@ -602,11 +647,11 @@ async def bot_status_changed(event: ChatMemberUpdated):
     try:
         await bot.send_message(
             CREATOR_ID,
-            f"🔔 <b>Yangi guruhdan botni ulash so'rovi keldi!</b>\n\n"
+            f"🔔 <b>Yangi guruhdan botni qo'shish so'rovi!</b>\n\n"
             f"👤 <b>Qo'shgan shaxs:</b> {esc(adder_name)} (ID: <code>{adder_id}</code>, {esc(adder_username)})\n"
             f"📌 <b>Guruh nomi:</b> {esc(chat_title)}\n"
             f"🆔 <b>Chat ID:</b> <code>{chat_id}</code>\n\n"
-            f"Ruxsat berasizmi?",
+            f"Tasdiqlaysizmi?",
             reply_markup=keyboard,
         )
     except Exception as e:
@@ -614,7 +659,7 @@ async def bot_status_changed(event: ChatMemberUpdated):
         try:
             await bot.send_message(
                 chat_id,
-                "⚠️ Yaratuvchiga so'rov yuborilmadi. Yaratuvchi avval botga shaxsiy chatda /start bosishi lozim.",
+                "⚠️ Yaratuvchiga so'rov yetib bormadi. Yaratuvchi avval botga shaxsiy chatda /start yuborishi kerak.",
             )
         except Exception:
             pass
@@ -631,11 +676,11 @@ async def approve_group(call: CallbackQuery):
     await call.answer()
 
     if not changed:
-        await call.message.edit_text(f"⚠️ Guruh (ID: {chat_id}) topilmadi. Bot guruhdan chiqarilgan bo'lishi mumkin.")
+        await call.message.edit_text(f"⚠️ Guruh (ID: {chat_id}) topilmadi. Bot allaqachon chiqib ketgan bo'lishi mumkin.")
         return
 
     _approved_groups_cache.add(chat_id)
-    await call.message.edit_text(f"✅ Guruh (ID: {chat_id}) muvaffaqiyatli tasdiqlandi!")
+    await call.message.edit_text(f"✅ Guruh (ID: {chat_id}) tasdiqlandi!")
     try:
         await bot.send_message(chat_id, intro_text())
     except Exception as e:
@@ -657,7 +702,7 @@ async def reject_group(call: CallbackQuery):
     try:
         await bot.send_message(
             chat_id,
-            "❌ Yaratuvchi tomonidan ushbu guruhga ruxsat berilmadi. Bot guruhni tark etmoqda. Xayr!",
+            "❌ Yaratuvchi tomonidan bu guruhga ruxsat berilmadi. Bot guruhni tark etmoqda.",
         )
     except Exception:
         pass
@@ -688,6 +733,7 @@ async def forget_member(chat_id: int, user_id: int):
 
 @dp.chat_member()
 async def member_status_changed(event: ChatMemberUpdated):
+    """Guruhga qo'shilgan/chiqqan a'zolarni (yozmagan bo'lsa ham) kuzatadi. Bot guruhda admin bo'lishi shart."""
     if event.chat.type not in GROUP_TYPES:
         return
     user = event.new_chat_member.user
@@ -695,6 +741,8 @@ async def member_status_changed(event: ChatMemberUpdated):
         return
     status = event.new_chat_member.status
     chat_id = event.chat.id
+    # Adminlik o'zgargan bo'lsa (tayinlandi/olib tashlandi), kesh darhol yangilansin
+    _admin_cache.pop((chat_id, user.id), None)
     try:
         is_member = status == "member" or (
             status == "restricted" and getattr(event.new_chat_member, "is_member", False)
@@ -702,6 +750,7 @@ async def member_status_changed(event: ChatMemberUpdated):
         if is_member:
             if await is_group_approved(chat_id):
                 await remember_member(chat_id, user)
+                # ban muddati tugab qaytgan bo'lsa, ro'yxatdan olib tashlanadi
                 await run("DELETE FROM banned_users WHERE chat_id = ? AND user_id = ?", (chat_id, user.id))
         elif status in ("left", "kicked"):
             await forget_member(chat_id, user.id)
@@ -710,6 +759,8 @@ async def member_status_changed(event: ChatMemberUpdated):
 
 
 class TrackMembersMiddleware(BaseMiddleware):
+    """A'zolarni kuzatadi. Handlerlarni BLOKLAMAYDI, xabar boshiga bazaga murojaat qilmaydi (keshlangan)."""
+
     async def __call__(
         self,
         handler: Callable[[Message, Dict[str, Any]], Awaitable[Any]],
@@ -740,9 +791,9 @@ dp.message.outer_middleware(TrackMembersMiddleware())
 async def cmd_start(message: Message):
     if message.chat.type == "private":
         await message.answer(
-            "🛡 <b>ExamGuard AI</b> tizimiga xush kelibsiz!\n\n"
-            "Meni o'quv guruhiga qo'shib administrator qilsangiz, vazifalar va intizomni qat'iy nazorat qilishni boshlayman. "
-            "Muddatlar bilan hazillashmayman, lekin har doim adolatli va xushmuomalama bo'lib qolaman 🙂"
+            "🛡 <b>ExamGuard AI</b> tizimiga xush kelibsiz.\n\n"
+            "Meni o'quv guruhiga qo'shib administrator qilsangiz, vazifalar va intizomni nazorat qilishni boshlayman. "
+            "Muddatlar bilan hazillashmayman, lekin muloyimligimni saqlayman 🙂"
         )
         return
 
@@ -751,11 +802,11 @@ async def cmd_start(message: Message):
         return
 
     if await is_user_admin(message):
-        await message.reply("🛡 <b>ExamGuard AI</b> guruhda to'liq nazorat rejimida ishlamoqda, Ustoz!")
+        await message.reply("🛡 <b>ExamGuard AI</b> guruhda to'liq nazorat rejimida ishlamoqda.")
     else:
         await message.reply(
-            f"Hurmatli <b>{label(message.from_user)}</b>, /start bosish bilan vazifa bajarilib qolmaydi 😉 "
-            "Yaxshisi /tasks buyrug'ini ochib, darsga kirishing."
+            f"Hurmatli <b>{label(message.from_user)}</b>, /start bosish vazifani bajarmaydi 😉 "
+            "Yaxshisi /tasks ni oching va ishga kirishing."
         )
 
 
@@ -766,20 +817,21 @@ async def cmd_help(message: Message):
     await message.answer(
         "🤖 <b>ExamGuard AI — Qo'llanma</b> 📖\n\n"
         "👨‍🏫 <b>Ustoz uchun (Adminlar):</b>\n"
-        "• <code>/task &lt;soat:min&gt; &lt;matn&gt;</code> — bugungi muddatga vazifa berish.\n"
+        "• <code>/task &lt;soat:min&gt; &lt;matn&gt;</code> — bugungi muddatga vazifa.\n"
         "• <code>/task &lt;kun&gt; &lt;soat:min&gt; &lt;matn&gt;</code> — kelgusi kunlarga vazifa.\n"
         "• Rasmli vazifa: rasm yuborib, izohiga <code>/task 21:00 1. ...</code> yozing.\n"
         "• <code>/extend</code> — muddatga 1 soat qo'shish.\n"
-        "• <code>/cancel_task</code> — joriy vazifani bekor qilish.\n"
-        "• <code>/banned_list</code> — chetlashtirilganlar ro'yxati.\n\n"
+        "• <code>/cancel_task</code> — vazifani bekor qilish.\n"
+        "• <code>/banned_list</code> — ban qilinganlar ro'yxati.\n\n"
         "👩‍🎓 <b>O'quvchilar uchun:</b>\n"
         "• O'zingizning ovozli xabaringizga reply qilib: <code>/answer &lt;raqam&gt;</code>.\n"
-        "• <code>/tasks</code> — faol vazifa. <code>/submissions</code> — topshirganlar ro'yxati.\n\n"
-        "⚠️ <b>Anticheat va intizom qoidalari:</b>\n"
-        "• Har bir savolga alohida va har xil soniyadagi ovoz yuboring. Bir xil yoki takroriy soniyadagi javob o'tmaydi.\n"
+        "• <code>/tasks</code> — faol vazifa. <code>/submissions</code> — topshirganlar.\n\n"
+        "⚠️ <b>Anticheat qoidalari:</b>\n"
+        "• Har bir savolga alohida va har xil soniyadagi (davomiylikdagi) ovoz yuboring. "
+        "Bir ovozni yoki bitta soniyadagi ovozni boshqa savolga ishlatib bo'lmaydi.\n"
         "• Forward qilingan, boshqa o'quvchiga tegishli yoki vazifadan oldin yozilgan ovoz qabul qilinmaydi.\n"
-        "• Xato yuborgan bo'lsangiz, o'sha savolga qayta voice yuborsangiz, eskisi yangisiga almashadi.\n"
-        f"• Muddatida topshirmaganlar ogohlantirishsiz {BAN_DAYS} kunga chetlashtiriladi."
+        "• Shu savolga qayta ovoz yuborsangiz, eskisi yangisiga almashadi.\n"
+        f"• Muddatida topshirmaganlar {BAN_DAYS} kunga chetlashtiriladi."
     )
 
 
@@ -789,10 +841,10 @@ async def cmd_rules(message: Message):
         return
     await message.answer(
         f"📜 <b>Intizom qoidalari:</b>\n"
-        f"1. Vazifa belgilangan muddatda, faqat jonli ovozli xabar bilan topshiriladi.\n"
-        f"2. Muddatida topshirmagan o'quvchi qoidaga ko'ra {BAN_DAYS} kunga guruhdan chetlashtiriladi.\n"
-        f"3. Ovozni takrorlash, boshqadan ko'chirish yoki forward qilish qat'iyan taqiqlanadi.\n"
-        f"Tartib hammaga bir xil. Intizom — muvaffaqiyat garovi!"
+        f"1. Vazifa muddatida, ovozli xabar bilan topshiriladi.\n"
+        f"2. Muddatida topshirmagan o'quvchi {BAN_DAYS} kunga guruhdan chetlashtiriladi.\n"
+        f"3. Ovozni almashtirish, takrorlash yoki forward qilish qabul qilinmaydi.\n"
+        f"Tartib hammaga bir xil. Ustoz vaqtni uzaytirsa, bu faqat Ustozning qarori."
     )
 
 
@@ -800,7 +852,7 @@ async def cmd_rules(message: Message):
 # USTOZ BUYRUQLARI
 # ============================================================================
 TASK_FORMAT_HELP = (
-    "⚠️ Ustoz, format biroz noto'g'ri kiritildi. To'g'ri namunalar:\n"
+    "⚠️ Format noto'g'ri. Namuna:\n"
     "1) Bugun uchun: <code>/task 21:00 1. What is your hobby? 2. Your dream job?</code>\n"
     "2) Kun bilan: <code>/task 1 21:00 1. What is your hobby?</code>\n"
     "🖼 Rasmli vazifa: rasm yuborib, izohiga shu formatda yozing."
@@ -818,10 +870,10 @@ async def create_task_from_message(message: Message, args_text: str):
     task_text = m.group(4).strip()
 
     if hours > 23 or minutes > 59:
-        await message.answer("⚠️ Ustoz, soat 0-23, daqiqa 0-59 oralig'ida bo'lishi kerak.")
+        await message.answer("⚠️ Soat 0-23, daqiqa 0-59 oralig'ida bo'lishi kerak.")
         return
     if days > 30:
-        await message.answer("⚠️ Kun soni 30 kundan oshmasligi kerak.")
+        await message.answer("⚠️ Kun soni 30 dan oshmasligi kerak.")
         return
 
     now = now_local()
@@ -832,6 +884,7 @@ async def create_task_from_message(message: Message, args_text: str):
         return
 
     deadline_str = fmt_local(deadline)
+    # Muddat 30 daqiqadan qisqa bo'lsa, ogohlantirish darhol yuborilib ketmasligi uchun
     warned_flag = 1 if (deadline - now) <= timedelta(minutes=WARN_MINUTES) else 0
     user = message.from_user
     chat_id = message.chat.id
@@ -853,6 +906,7 @@ async def create_task_from_message(message: Message, args_text: str):
         )
         await db.commit()
 
+    request_backup()
     await send_task_card(
         chat_id,
         "📢 <b>YANGI CEFR VAZIFASI E'LON QILINDI!</b> 🎯",
@@ -860,7 +914,7 @@ async def create_task_from_message(message: Message, args_text: str):
         deadline_str,
         photo_id,
         "🎙 O'zingizning ovozli xabaringizga reply qilib <code>/answer &lt;raqam&gt;</code> yuboring.\n"
-        f"⚠️ <i>Diqqat: muddatida topshirmaganlar {BAN_DAYS} kunga guruhdan chetlashtiriladi.</i>",
+        f"⚠️ <i>Muddatida topshirmaganlar {BAN_DAYS} kunga chetlashtiriladi.</i>",
     )
 
 
@@ -871,6 +925,7 @@ async def cmd_task(message: Message, command: CommandObject):
     await create_task_from_message(message, command.args or "")
 
 
+# Rasmli vazifa (Command filteri caption'ni ushlamagan holat uchun zaxira)
 @dp.message(F.photo, F.caption.regexp(TASK_CAPTION_RE))
 async def task_with_photo(message: Message):
     if not await group_guard(message, admin_only=True):
@@ -883,7 +938,7 @@ async def cmd_cancel_task(message: Message):
     if not await group_guard(message, admin_only=True):
         return
     await run("UPDATE tasks SET is_active = 0 WHERE chat_id = ?", (message.chat.id,))
-    await message.answer("ℹ️ <b>Joriy vazifa Ustoz tomonidan bekor qilindi.</b>")
+    await message.answer("ℹ️ <b>Joriy vazifa Ustoz tomonidan bekor qilindi.</b> Yangi vazifa kutamiz.")
 
 
 @dp.message(Command("extend"))
@@ -902,7 +957,7 @@ async def cmd_extend(message: Message):
 
     await message.answer(
         "⏳ <b>Vazifa muddati uzaytirildi.</b>\n"
-        "Ustoz qo'shimcha <b>1 soat</b> vaqt berdilar. Ushbu imkoniyatdan oqilona foydalaning.\n"
+        "Ustoz qo'shimcha <b>1 soat</b> berdi. Vaqtdan oqilona foydalaning.\n"
         f"⏰ <b>Yangi oxirgi muddat:</b> <code>{new_deadline_str}</code>"
     )
 
@@ -918,7 +973,7 @@ async def cmd_banned_list(message: Message):
         (message.chat.id, fmt_local(now_local())),
     )
     if not rows:
-        await message.answer("🛡 Hozirda chetlashtirilgan o'quvchilar yo'q. Guruh intizomi a'lo darajada!")
+        await message.answer("🛡 Hozirda ban qilingan o'quvchilar yo'q. Intizom a'lo darajada.")
         return
 
     lines = [
@@ -951,20 +1006,21 @@ async def cmd_tasks(message: Message):
         task_text,
         deadline_str,
         photo_id,
-        "🎙 Javob berish: o'zingizning ovozli xabaringizga reply qilib <code>/answer &lt;raqam&gt;</code> yuboring.",
+        "🎙 Javob: o'zingizning ovozli xabaringizga reply qilib <code>/answer &lt;raqam&gt;</code> yuboring.",
     )
 
 
 @dp.message(Command("answer"))
 async def cmd_answer(message: Message, command: CommandObject):
     if message.chat.type == "private":
-        await message.answer("⚠️ Kechirasiz, javobingizni guruhga yuborishingiz shart.")
+        await message.answer("⚠️ Javobingizni guruhga yuboring.")
         return
     if not await group_guard(message):
         return
     await process_answer(message, command.args or "")
 
 
+# Voice caption'iga /answer yozilgan bo'lsa (Command filteri ushlamagan holat uchun zaxira)
 @dp.message(F.voice, F.caption.regexp(ANSWER_RE))
 async def voice_with_caption(message: Message):
     if message.chat.type == "private" or not await group_guard(message):
@@ -992,7 +1048,7 @@ async def cmd_submissions(message: Message):
         (chat_id, task_row[0]),
     )
     if not rows:
-        await message.answer("📂 Hozircha hech kim vazifa topshirmagan. Barchadan faollik kutamiz!")
+        await message.answer("📂 Hozircha hech kim vazifa topshirmagan.")
         return
 
     users: Dict[int, Tuple[str, List[Tuple[int, str]]]] = {}
@@ -1008,7 +1064,7 @@ async def cmd_submissions(message: Message):
         f"• <b>{esc(name)}</b> — {', '.join(text for _, text in sorted(items))}"
         for name, items in users.values()
     ]
-    await send_chunks(message, f"📋 <b>Topshirganlar ro'yxati — {len(users)} nafar o'quvchi:</b>\n", lines)
+    await send_chunks(message, f"📋 <b>Topshirganlar ro'yxati — {len(users)} ta:</b>\n", lines)
 
 
 # ============================================================================
@@ -1020,7 +1076,8 @@ async def finish_task(task_id: int, chat_id: int):
         cur = await db.execute("UPDATE tasks SET is_active = 0 WHERE id = ? AND is_active = 1", (task_id,))
         await db.commit()
         if cur.rowcount == 0:
-            return
+            return  # allaqachon yopilgan
+    request_backup()
 
     submitted = {r[0] for r in await q_all("SELECT DISTINCT user_id FROM answers WHERE task_id = ?", (task_id,))}
     members = await q_all(
@@ -1055,7 +1112,7 @@ async def finish_task(task_id: int, chat_id: int):
             try:
                 await bot.send_message(
                     chat_id,
-                    "✅ Vazifa topshirish vaqti yakunlandi. Barcha o'quvchilar o'z vaqtida topshirgan — intizom a'lo darajada. Rahmat!",
+                    "✅ Vazifa topshirish vaqti tugadi. Hamma muddatida topshirgan, intizom a'lo. Rahmat!",
                 )
             except Exception as e:
                 logging.warning(f"[{chat_id}] xabar yuborilmadi: {e}")
@@ -1092,12 +1149,13 @@ async def finish_task(task_id: int, chat_id: int):
             await db.commit()
         for uid, _ in banned:
             _seen.discard((chat_id, uid))
+        request_backup()
 
         try:
             await bot.send_message(
                 chat_id,
-                "⛔️ <b>Vazifa topshirish vaqti yakunlandi.</b>\n"
-                f"Belgilangan muddatda vazifani bajarmagan o'quvchilar qoidaga muvofiq {BAN_DAYS} kunga guruhdan chetlashtirildilar. "
+                "⛔️ <b>Vazifa topshirish vaqti tugadi.</b>\n"
+                f"Muddatida topshirmagan o'quvchilar qoidaga muvofiq {BAN_DAYS} kunga chetlashtirildi. "
                 f"Intizom — natija kaliti. {BAN_DAYS} kundan so'ng ko'rishguncha!",
             )
         except Exception as e:
@@ -1107,7 +1165,7 @@ async def finish_task(task_id: int, chat_id: int):
         try:
             await bot.send_message(
                 chat_id,
-                f"⚠️ {failed} nafar o'quvchini chetlashtira olmadim. Iltimos, menga adminlik sozlamalaridan "
+                f"⚠️ {failed} ta o'quvchini chetlashtira olmadim. Menga adminlikda "
                 f"<b>a'zolarni cheklash (ban)</b> huquqini bering.",
             )
         except Exception:
@@ -1115,16 +1173,17 @@ async def finish_task(task_id: int, chat_id: int):
 
 
 async def warn_task(task_id: int, chat_id: int):
+    # warned_30 bayrog'i xabar yuborishdan OLDIN o'rnatiladi: ogohlantirish faqat bir marta ketadi
     changed = await run("UPDATE tasks SET warned_30 = 1 WHERE id = ? AND warned_30 = 0", (task_id,))
     if not changed:
         return
     try:
         await bot.send_message(
             chat_id,
-            "⏰ <b>DIQQAT: OGOHLANTIRISH!</b>\n"
-            f"Vazifa topshirish muddatiga atigi <b>{WARN_MINUTES} daqiqa</b> qoldi. Hali javob yubormaganlar — shoshiling, "
-            f"keyin \"internet o'chib qoldi\" kabi bahonalar o'tmaydi 😉\n"
-            f"Muddatida topshirmaganlar {BAN_DAYS} kunga chetlashtiriladilar.",
+            "⏰ <b>OGOHLANTIRISH!</b>\n"
+            f"Topshirish muddatiga <b>{WARN_MINUTES} daqiqa</b> qoldi. Hali topshirmaganlar — hozir yozing, "
+            f"keyin \"internet o'chib qoldi\" ketmaydi 😉\n"
+            f"Muddatida topshirmaganlar {BAN_DAYS} kunga chetlashtiriladi.",
         )
     except Exception as e:
         logging.warning(f"[{chat_id}] ogohlantirish yuborilmadi: {e}")
@@ -1132,20 +1191,25 @@ async def warn_task(task_id: int, chat_id: int):
 
 async def check_deadlines():
     tick = 0
+    # Qayta yoqilganda Telegram'da yig'ilib qolgan javoblar ulgurib qolishi uchun ozgina kutamiz
+    await asyncio.sleep(STARTUP_GRACE)
     while True:
         try:
             now = now_local()
             now_str = fmt_local(now)
             warn_str = fmt_local(now + timedelta(minutes=WARN_MINUTES))
 
+            # 1) Muddati tugaganlar (bitta SQL so'rov, indeks bilan)
             for task_id, chat_id in await q_all(
                 "SELECT id, chat_id FROM tasks WHERE is_active = 1 AND deadline <= ?", (now_str,)
             ):
+                # Har bir guruh alohida: bittasidagi xato siklni to'xtatmaydi
                 try:
                     await finish_task(task_id, chat_id)
                 except Exception:
                     logging.exception(f"Vazifa {task_id} (guruh {chat_id}) ni yopishda xatolik")
 
+            # 2) 30 daqiqa qolganlar
             for task_id, chat_id in await q_all(
                 "SELECT id, chat_id FROM tasks WHERE is_active = 1 AND warned_30 = 0 "
                 "AND deadline > ? AND deadline <= ?",
@@ -1157,7 +1221,7 @@ async def check_deadlines():
                     logging.exception(f"Vazifa {task_id} (guruh {chat_id}) ogohlantirishida xatolik")
 
             tick += 1
-            if tick % 30 == 0:
+            if tick % 30 == 0:  # taxminan har daqiqada muddati o'tgan banlarni va eski keshlarni tozalash
                 await run("DELETE FROM banned_users WHERE unban_at <= ?", (now_str,))
                 t = time.monotonic()
                 for key in [k for k, v in _admin_cache.items() if v[1] <= t]:
@@ -1169,14 +1233,198 @@ async def check_deadlines():
 
 
 # ============================================================================
+# ZAXIRA NUSXA (Telegram orqali): deploy / restart bo'lsa ham ma'lumot yo'qolmaydi
+# ============================================================================
+# Ishlash tartibi:
+#  * Baza o'zgarganda bot baza faylini yaratuvchining shaxsiy chatiga yuboradi va QADAB (pin) qo'yadi.
+#  * Keyingi safar bot ishga tushganda baza fayli bo'lmasa (masalan Render'da), o'sha qadalgan fayldan tiklaydi.
+#  * Server o'chirilayotganda (SIGTERM) bot oxirgi nusxani yuborib ulguradi.
+_backup_event: Optional[asyncio.Event] = None
+_backup_msg_id: Optional[int] = None
+_last_backup_hash: Optional[str] = None
+
+
+def request_backup():
+    if _backup_event is not None:
+        _backup_event.set()
+
+
+def _snapshot_db(src_path: str, dst_path: str):
+    """SQLite'ning rasmiy backup API'si: bot ishlab turganda ham izchil nusxa oladi."""
+    if os.path.exists(dst_path):
+        os.remove(dst_path)
+    src = sqlite3.connect(src_path, timeout=30)
+    try:
+        dst = sqlite3.connect(dst_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
+def _file_sha256(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _validate_db(path: str) -> bool:
+    try:
+        conn = sqlite3.connect(path)
+        try:
+            ok = conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+            tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        finally:
+            conn.close()
+        return ok and "groups" in tables
+    except Exception:
+        return False
+
+
+async def restore_db_if_missing():
+    global _backup_msg_id
+    if not BACKUP_ENABLED:
+        return
+    if os.path.exists(DB_NAME) and os.path.getsize(DB_NAME) > 0:
+        return  # baza bor (VPS): hech narsa tegilmaydi
+
+    try:
+        me = await bot.me()
+        chat = await bot.get_chat(BACKUP_CHAT_ID)
+        pinned = getattr(chat, "pinned_message", None)
+        if not (pinned and pinned.document and pinned.from_user and pinned.from_user.id == me.id
+                and pinned.document.file_name == BACKUP_FILENAME):
+            logging.info("Tiklash uchun zaxira nusxa topilmadi (birinchi ishga tushirish bo'lishi mumkin).")
+            return
+
+        os.makedirs(os.path.dirname(os.path.abspath(DB_NAME)), exist_ok=True)
+        tmp_path = DB_NAME + ".restore"
+        await bot.download(pinned.document.file_id, destination=tmp_path)
+        if not await asyncio.to_thread(_validate_db, tmp_path):
+            logging.error("Yuklab olingan zaxira nusxa buzilgan, tiklanmadi!")
+            os.remove(tmp_path)
+            return
+
+        for suffix in ("-wal", "-shm"):
+            if os.path.exists(DB_NAME + suffix):
+                os.remove(DB_NAME + suffix)
+        os.replace(tmp_path, DB_NAME)
+        _backup_msg_id = pinned.message_id
+        print("♻️ Baza Telegram'dagi zaxira nusxadan tiklandi!")
+    except Exception as e:
+        logging.error(f"Zaxira nusxadan tiklab bo'lmadi: {e}")
+
+
+async def backup_db(force: bool = False):
+    global _backup_msg_id, _last_backup_hash
+    if not BACKUP_ENABLED or not os.path.exists(DB_NAME):
+        return
+
+    snap = DB_NAME + ".snapshot"
+    await asyncio.to_thread(_snapshot_db, DB_NAME, snap)
+    digest = await asyncio.to_thread(_file_sha256, snap)
+    if digest == _last_backup_hash and not force:
+        return  # o'zgarish yo'q
+
+    caption = f"💾 ExamGuard zaxira nusxa\n🕒 {fmt_local(now_local())}\n#{digest[:8]}"
+
+    if _backup_msg_id:
+        try:
+            await bot.edit_message_media(
+                chat_id=BACKUP_CHAT_ID,
+                message_id=_backup_msg_id,
+                media=InputMediaDocument(media=FSInputFile(snap, filename=BACKUP_FILENAME), caption=caption),
+            )
+            _last_backup_hash = digest
+            return
+        except Exception as e:
+            logging.warning(f"Zaxira xabarini yangilab bo'lmadi, yangisi yuboriladi: {e}")
+            _backup_msg_id = None
+
+    msg = await bot.send_document(
+        BACKUP_CHAT_ID,
+        FSInputFile(snap, filename=BACKUP_FILENAME),
+        caption=caption,
+        disable_notification=True,
+    )
+    _backup_msg_id = msg.message_id
+    try:
+        await bot.pin_chat_message(BACKUP_CHAT_ID, msg.message_id, disable_notification=True)
+    except Exception as e:
+        logging.warning(f"Zaxira xabarini qadab bo'lmadi (tiklash ishlamasligi mumkin): {e}")
+    _last_backup_hash = digest
+
+
+async def backup_loop():
+    while True:
+        try:
+            await asyncio.wait_for(_backup_event.wait(), timeout=BACKUP_INTERVAL)
+        except asyncio.TimeoutError:
+            pass
+        _backup_event.clear()
+        try:
+            await backup_db()
+        except Exception as e:
+            logging.error(
+                f"Zaxira nusxa yuborilmadi: {e}. Yaratuvchi botga shaxsiy chatda /start yuborganmi?"
+            )
+        await asyncio.sleep(BACKUP_MIN_GAP)
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: Message):
+    """Faqat yaratuvchi, shaxsiy chatda: zaxira nusxani hoziroq yangilaydi (tekshirish uchun)."""
+    if message.chat.type != "private" or not message.from_user or message.from_user.id != CREATOR_ID:
+        return
+    try:
+        await backup_db(force=True)
+        await message.answer("💾 Zaxira nusxa yangilandi va qadab (pin) qo'yildi.")
+    except Exception as e:
+        await message.answer(f"⚠️ Zaxira nusxa yuborilmadi: {esc(str(e))}")
+
+
+# ============================================================================
+# SOG'LIQNI TEKSHIRISH SERVERI (Render web service + UptimeRobot uchun)
+# ============================================================================
+async def start_health_server() -> Optional[web.AppRunner]:
+    port = os.getenv("PORT")
+    if not port:
+        return None  # VPS da kerak emas
+
+    async def ok(_request):
+        return web.Response(text="ExamGuard AI is running")
+
+    app = web.Application()
+    app.router.add_get("/", ok)
+    app.router.add_get("/health", ok)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    print(f"🌐 Health-server {port}-portda ishlayapti")
+    return runner
+
+
+# ============================================================================
 # ISHGA TUSHIRISH
 # ============================================================================
 async def main():
+    global _backup_event
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+    _backup_event = asyncio.Event()
+
+    health_runner = await start_health_server()  # Render portni tezroq ko'rishi uchun birinchi
+    await restore_db_if_missing()
     await init_db()
     await set_bot_commands()
+
     scheduler = asyncio.create_task(check_deadlines())
-    print("🛡 ExamGuard AI qat'iy intizom, xushmuomala nazorat va anticheat rejimida ishga tushdi!")
+    backup_task = asyncio.create_task(backup_loop())
+    request_backup()  # ishga tushganda ham birinchi zaxira nusxa yaratilsin
+    print("🛡 ExamGuard AI qat'iy intizom va anticheat rejimida ishga tushdi!")
     try:
         await dp.start_polling(
             bot,
@@ -1184,42 +1432,30 @@ async def main():
         )
     finally:
         scheduler.cancel()
+        backup_task.cancel()
+        try:
+            await asyncio.wait_for(backup_db(), timeout=20)  # o'chirilishdan oldin oxirgi nusxa
+        except Exception as e:
+            logging.error(f"Oxirgi zaxira nusxa yuborilmadi: {e}")
         if _db_conn:
             await _db_conn.close()
+        if health_runner:
+            await health_runner.cleanup()
         await bot.session.close()
 
 
-from aiohttp import web
-
-from aiohttp import web
-
-async def handle_ping(request):
-    return web.Response(text="OK", status=200)
-
-async def web_server():
-    app = web.Application()
-    app.router.add_get("/", handle_ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.environ.get("PORT", 10000))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
-
-async def main_with_web():
-    await web_server()
-    await main()
-
 def run_app():
+    # Linux/macOS da uvloop o'rnatilgan bo'lsa tezroq ishlaydi (pip install uvloop), Windows da oddiy asyncio
     try:
         import uvloop  # type: ignore
 
         if sys.version_info >= (3, 11):
             with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
-                runner.run(main_with_web())
+                runner.run(main())
             return
     except ImportError:
         pass
-    asyncio.run(main_with_web())
+    asyncio.run(main())
 
 
 if __name__ == "__main__":
