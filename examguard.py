@@ -1194,7 +1194,7 @@ from aiohttp import web
 from aiohttp import web
 
 async def handle_ping(request):
-    return web.Response(text="ExamGuard AI is running!")
+    return web.Response(text="OK", status=200)
 
 async def web_server():
     app = web.Application()
