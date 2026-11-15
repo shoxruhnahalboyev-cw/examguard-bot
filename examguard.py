@@ -772,24 +772,28 @@ dp.message.outer_middleware(TrackMembersMiddleware())
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     if message.chat.type == "private":
-        await message.answer(
-            "🛡 <b>ExamGuard AI</b> tizimiga xush kelibsiz.\n\n"
-            "Meni o'quv guruhiga qo'shib administrator qilsangiz, vazifalar va intizomni nazorat qilishni boshlayman. "
-            "Muddatlar bilan hazillashmayman, lekin muloyimligimni saqlayman 🙂"
-        )
+        await message.answer("🛡 <b>ExamGuard AI</b> ishga tushdi. Zaxira nusxa uchun /backup ishlating.")
         return
 
-    if not await is_group_approved(message.chat.id):
+    chat_id = message.chat.id
+    user_id = message.from_user.id if message.from_user else 0
+
+    # Agar guruhda /start ni yaratuvchi yozsa yoki admin bo'lsa, guruh darhol avtomatik tasdiqlanadi!
+    if user_id == CREATOR_ID or await is_user_admin(message):
+        await run(
+            "INSERT INTO groups (chat_id, is_approved) VALUES (?, 1) "
+            "ON CONFLICT(chat_id) DO UPDATE SET is_approved = 1",
+            (chat_id,),
+        )
+        _approved_groups_cache.add(chat_id)
+        await message.reply("✅ Guruh muvaffaqiyatli avtomatik tasdiqlandi va faollashdi!")
+        return
+
+    if not await is_group_approved(chat_id):
         await message.reply("⚠️ Bu guruh hali tasdiqlanmagan.")
         return
 
-    if await is_user_admin(message):
-        await message.reply("🛡 <b>ExamGuard AI</b> guruhda to'liq nazorat rejimida ishlamoqda.")
-    else:
-        await message.reply(
-            f"Hurmatli <b>{label(message.from_user)}</b>, /start bosish vazifani bajarmaydi 😉 "
-            "Yaxshisi /tasks ni oching va ishga kirishing."
-        )
+    await message.reply("🛡 <b>ExamGuard AI</b> guruhda nazorat rejimida ishlamoqda.")
 
 
 @dp.message(Command("help"))
