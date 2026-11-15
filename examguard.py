@@ -522,14 +522,14 @@ async def process_answer(message: Message, args_text: str):
         return
 
     created = parse_utc(created_at) if created_at else None
-    voice_date = voice_msg.date
-    if voice_date and voice_date.tzinfo is None:
-        voice_date = UTC.localize(voice_date)
-    if created and voice_date and voice_date < created - timedelta(seconds=5):
-        await message.reply(
-            f"⛔️ <b>{name}</b>, bu ovoz vazifa e'lon qilinishidan oldin yozilgan. Vazifadan keyin yangi ovoz yozing."
-        )
-        return
+voice_date = voice_msg.date
+if voice_date and voice_date.tzinfo is None:
+    voice_date = UTC.localize(voice_date)
+if created and voice_date and voice_date < created - timedelta(seconds=5):
+    await message.reply(
+        f"⛔️ <b>{name}</b>, bu ovoz vazifa e'lon qilinishidan oldin yozilgan. Vazifadan keyin yangi ovoz yozing."
+    )
+    return
 
     success, err = await save_answer(message.chat.id, task_id, user, question_num, voice)
     if success and err == "updated":
