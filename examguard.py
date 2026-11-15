@@ -1189,17 +1189,37 @@ async def main():
         await bot.session.close()
 
 
+from aiohttp import web
+
+from aiohttp import web
+
+async def handle_ping(request):
+    return web.Response(text="ExamGuard AI is running!")
+
+async def web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+async def main_with_web():
+    await web_server()
+    await main()
+
 def run_app():
     try:
         import uvloop  # type: ignore
 
         if sys.version_info >= (3, 11):
             with asyncio.Runner(loop_factory=uvloop.new_event_loop) as runner:
-                runner.run(main())
+                runner.run(main_with_web())
             return
     except ImportError:
         pass
-    asyncio.run(main())
+    asyncio.run(main_with_web())
 
 
 if __name__ == "__main__":
